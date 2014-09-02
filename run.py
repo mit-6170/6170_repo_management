@@ -13,7 +13,7 @@ from datetime import datetime
 
 tasks = []
 #TODO: make this into a command-line argument
-ORG_NAME = '6170-sp13'
+ORG_NAME = '6170-fa14'
 
 class TaskFailure(Exception):
     pass
@@ -128,6 +128,7 @@ class GithubWrapper(object):
                     }
             print "Creating team with name {}".format(team_name)
             r = self.post("/orgs/{}/teams".format(ORG_NAME), data=json.dumps(data))
+            print r.text
             if r.status_code != 201:
                 raise TaskFailure("Failed to create team")
             return r.json()
@@ -239,6 +240,8 @@ def get_auth_token():
             "note":"6.170 student repo management script",
             }
     r = requests.post(url,data=json.dumps(data),auth=(username,password))
+    print r.text
+    print r.status_code
     if r.status_code != 201:
         raise TaskFailure("Your github credentials were invalid")
     g = GithubWrapper(r.json()['token'])
@@ -269,7 +272,7 @@ def make_repos(project_name):
         handout_code_repo = "git@github.com:{}/{}.git".format(ORG_NAME,project_name)
         clone_successful = os.system("git clone {}".format(handout_code_repo)) == 0
         if not clone_successful:
-            raise TaskFailed("Could not clone {}. Make sure that the repository exists, and that"\
+            raise TaskFailure("Could not clone {}. Make sure that the repository exists, and that"\
                     "your github private key is installed on this system".format(project_name))
         os.chdir(project_name)
         #pull all of the remote branches
@@ -317,7 +320,7 @@ directory.
 def clone_repos(project_name):
     g = GithubWrapper.load()
     dirname = os.path.join("cloned_repos","{} {}".format(
-        project_name, str(datetime.datetime.now())))
+        project_name, str(datetime.now())))
     os.makedirs(dirname)
     try:
         cwd = os.getcwd()
