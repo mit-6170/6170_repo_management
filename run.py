@@ -7,6 +7,9 @@ import json
 import getpass
 import datetime
 import re
+import csv
+import subprocess
+import pprint
 
 from datetime import datetime
 
@@ -136,7 +139,13 @@ class GithubWrapper(object):
             return team
 
     def get_team(self, team_name):
+
         all_teams = self.get("orgs/{}/teams".format(ORG_NAME)).json()
+        header = self.head("orgs/{}/teams".format(ORG_NAME))
+        while 'next' in header.links:
+            page_query = header.links["next"]["url"].split('?')[1]
+            all_teams += self.get("orgs/{}/teams?".format(ORG_NAME)+page_query).json()
+            header = self.head("orgs/{}/teams?".format(ORG_NAME)+page_query)
         all_teams_dict = dict((x['name'],x['id']) for x in all_teams)
         if team_name not in all_teams_dict:
             return None
@@ -154,10 +163,15 @@ class GithubWrapper(object):
         if r.status_code != 204:
             raise TaskFailure("Failed to add user to team, user does not exist.")
     
-    def add_user(self, athena, github):
+    def add_user(self, athenas, githubs):
+        athena_string = "_".join(athenas)
+        github_string = "_".join(githubs)
         team_name = "{}_{}".format(athena,github)
         team = self.get_or_create_team(team_name)
-        self.add_user_to_team(github, team)
+        
+        for github in githubs:
+            self.add_user_to_team(github, team)
+
         return team
 
     def create_repo(self, repo_name, team_id):
@@ -170,6 +184,10 @@ class GithubWrapper(object):
         if r.status_code != 201:
             raise TaskFailure("Failed to create repo: {}".format(r.content))
         return r.json()
+
+    def get_repo_ssh(self, repo_name):
+        r = self.get('/repos/{}/{}'.format(ORG_NAME, repo_name))
+        return r.json()['ssh_url']
 
     def add_repo_to_team(self, repo_name, team):
         print "Adding repo {} to team {}".format(repo_name, team['id'])
@@ -285,18 +303,27 @@ def make_repos(project_name):
             print "Processing: {}".format(line)
             failures.append(line)
             try:
-                athena, github = line.split()
+                athena_githubs = line.split()
             except:
                 print 'Line: "{}" must be of the form "athena_name github_name". Skipping'.format(line)
                 continue
+
+            if len(athena_githubs) % 2 != 0:
+                print "... and have an event number of tokens. Skipping".format(line)
+                continue
+
+            athenas = [athena_githubs[i] for i in range(0, len(athena), 2)]
+            githubs = [athena_githubs[i] for i in range(1, len(athena), 2)]
+
             try:
-                print 'Adding user'
-                team = g.add_user(athena,github)
+                print 'Adding user(s)'
+                team = g.add_user(athenas,githubs)
             except Exception as e:
                 print "Failed to add user: {}".format(e)
                 continue
             try:
-                repo_name = "{}_{}".format(athena,project_name)
+                athena_string = "_".join(athenas)
+                repo_name = "{}_{}".format(athena_string,project_name)
                 print 'Creating repo: {}'.format(repo_name)
                 repo = g.create_repo(repo_name,team['id'])
             except Exception as e:
@@ -530,6 +557,87 @@ def fetch_all_comments(proj_name):
                 f.write("</ul>")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(CONCLUSION.format(now))
+
+@task("""
+Grades all repos with the name "username_project"
+using a grading file passed in.
+
+Reads from stdin. Each line should have one token,
+the URL of the tree for the commit to be graded.
+
+The grades will be outputted in a CSV spreadsheet
+""")
+def grade(script_name, checker_name=None):
+    g = GithubWrapper.load()
+
+    # TODO: This is pretty ugly. Should pass in the name of a grades file instead
+    project_name = script_name.split('_')[1].split('.')[0]
+    grades_file = open('grades_{}.csv'.format(project_name), 'w+')
+
+
+    # Write all lines in grades out to grades_file
+    writer = csv.writer(grades_file)
+
+    grades = []
+    failures = []
+
+    try:
+        cwd = os.getcwd()
+
+        for line in sys.stdin:
+            print "Grading {}".format(line)
+
+            # Separate out name of repository
+            line_wo_org = line.split('/'+ORG_NAME+'/')[1]
+            repo_name = line_wo_org.split('/')[0]
+            commit_sha = line_wo_org.split('/')[2]
+
+            # Go to repos/6170-fa14/repo_name and grab ssh URL
+            repo_ssh = g.get_repo_ssh(repo_name)
+
+            # Clone repo
+            clone_success = os.system("git clone {}".format(repo_ssh)) == 0
+            if not clone_success:
+                    print "Clone Failed"
+                    failures.append(line)
+            else:
+                # Checkout SHA we're interested in
+                os.chdir(repo_name)
+                checkout_success = os.system("git checkout {}".format(commit_sha)) == 0
+                if not checkout_success:
+                    print commit_sha
+                    print "Incorrect commit SHA"
+                    failures.append(line)
+                else:
+                    # Run checker if one is given
+                    if checker_name:
+                        checker_success = os.system("node ../{}".format(checker_name)) == 0
+                        if not checker_success:
+                            failures.append(line)
+                            # If the checker fails, we want to keep the repo so we can manually check the code
+                            os.chdir(cwd)
+                            continue
+
+                    grader_p = subprocess.Popen(["node", "../{}".format(script_name)],
+                        stdout=subprocess.PIPE)
+
+                    out, err= grader_p.communicate()
+                    grader_string = out.splitlines()[-1]
+                    grade_line = [repo_name.split('_')[0], line.rstrip()] + json.loads(grader_string)
+                    grades.append(grade_line)
+                    writer.writerow(grade_line)
+
+                # Delete cloned repo
+                os.chdir(cwd)
+                os.system("rm -r {}".format(repo_name))
+        
+        # print out list of failures
+        pp = pprint.PrettyPrinter(indent=4)
+        pp.pprint(failures)
+
+    finally:
+        os.chdir(cwd)
+
 
 if __name__ == '__main__':
     run()
